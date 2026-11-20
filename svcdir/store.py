@@ -39,11 +39,13 @@ from pathlib import Path
 from typing import Any, Callable
 
 from .errors import (
+    AlreadyRepaired,
     BackupNameTaken,
     BackupValidationError,
     ConflictError,
     DatabaseBusy,
     DatabaseError,
+    DirectoryCorrupt,
     DirectoryError,
     InputError,
     NotFoundError,
@@ -368,11 +370,39 @@ class DirectoryStore:
         conn.execute("DELETE FROM meta WHERE key=?", (key,))
 
     def _current_version(self, conn: sqlite3.Connection) -> int:
+        """Return the published version id or raise :class:`DirectoryCorrupt`.
+
+        A missing/invalid ``current_version`` and a pointer to a version that
+        no longer exists are both treated as corruption.  The former used to
+        make every page fail; the latter used to read as an empty directory,
+        which silently served ``count: 0`` to clients.
+        """
+        problem = self._directory_problem(conn)
+        if problem is not None:
+            raise DirectoryCorrupt(details=[problem])
+        return int(self._meta_get(conn, "current_version"))  # type: ignore[arg-type]
+
+    def _directory_problem(self, conn: sqlite3.Connection) -> str | None:
+        """Describe why the published directory is unreadable, if it is."""
         raw = self._meta_get(conn, "current_version")
+        if raw is None:
+            return "meta.current_version 缺失（当前目录版本号丢失）"
         try:
-            return int(raw)
+            version = int(raw)
         except (TypeError, ValueError):
-            raise ConflictError("目录状态损坏：current_version 无效", code="corrupt_state")
+            return f"meta.current_version 无效：{raw!r}"
+        row = conn.execute("SELECT 1 FROM versions WHERE id=?", (version,)).fetchone()
+        if row is None:
+            return f"meta.current_version={version} 指向不存在的目录版本"
+        return None
+
+    def _assert_intact(self, conn: sqlite3.Connection) -> int:
+        """Directory-dependent writes require a readable current version."""
+        problem = self._directory_problem(conn)
+        if problem is not None:
+            raise DirectoryCorrupt(details=[problem])
+        return int(self._meta_get(conn, "current_version"))  # type: ignore[arg-type]
+
 
     def _set_current(self, conn: sqlite3.Connection, version_id: int) -> None:
         self._meta_set(conn, "current_version", str(version_id))
@@ -529,41 +559,21 @@ class DirectoryStore:
     def list_backups(self) -> list[dict]:
         self._ensure_ready()
         with self._txn(write=False) as conn:
-            rows = conn.execute(
-                "SELECT name, version_id, created_at, digest, entry_count "
-                "FROM backups ORDER BY created_at DESC, name"
-            ).fetchall()
-        return [
-            {
-                "name": str(r["name"]),
-                "version": int(r["version_id"]),
-                "created_at": str(r["created_at"]),
-                "digest": str(r["digest"]),
-                "entry_count": int(r["entry_count"]),
-            }
-            for r in rows
-        ]
+            return self._backup_rows(conn)
 
     def snapshot(self) -> dict:
-        """Coherent view used by the HTML page and ``/api/state``."""
+        """Coherent view used by the HTML page and ``/api/state``.
+
+        Raises :class:`DirectoryCorrupt` when the published version pointer is
+        missing or dangling; callers that want to offer rescue use
+        :meth:`rescue_snapshot` instead.
+        """
         self._ensure_ready()
         with self._txn(write=False) as conn:
             version = self._current_version(conn)
             rows = self._entries(conn, version)
             restore = self._restore_summary(conn)
-            backups = [
-                {
-                    "name": str(r["name"]),
-                    "version": int(r["version_id"]),
-                    "created_at": str(r["created_at"]),
-                    "digest": str(r["digest"]),
-                    "entry_count": int(r["entry_count"]),
-                }
-                for r in conn.execute(
-                    "SELECT name, version_id, created_at, digest, entry_count "
-                    "FROM backups ORDER BY created_at DESC, name"
-                ).fetchall()
-            ]
+            backups = self._backup_rows(conn)
         return {
             "version": version,
             "count": len(rows),
@@ -572,6 +582,40 @@ class DirectoryStore:
             ],
             "restore": restore,
             "backups": backups,
+        }
+
+    def _backup_rows(self, conn: sqlite3.Connection) -> list[dict]:
+        return [
+            {
+                "name": str(r["name"]),
+                "version": int(r["version_id"]),
+                "created_at": str(r["created_at"]),
+                "digest": str(r["digest"]),
+                "entry_count": int(r["entry_count"]),
+            }
+            for r in conn.execute(
+                "SELECT name, version_id, created_at, digest, entry_count "
+                "FROM backups ORDER BY created_at DESC, name"
+            ).fetchall()
+        ]
+
+    def rescue_snapshot(self) -> dict:
+        """What the rescue page needs: why it is broken plus the backups.
+
+        Deliberately does not read the current version, so it still works when
+        that pointer is lost or dangling.  Named backups live in the same
+        SQLite database and remain readable.
+        """
+        self._ensure_ready()
+        with self._txn(write=False) as conn:
+            problem = self._directory_problem(conn)
+            backups = self._backup_rows(conn)
+            restore = self._restore_summary(conn)
+        return {
+            "corrupt": problem is not None,
+            "problem": problem,
+            "backups": backups,
+            "restore": restore,
         }
 
     def ping(self) -> None:
@@ -651,9 +695,11 @@ class DirectoryStore:
         backup_name = validate_backup_name(name)
         self._ensure_ready()
         with self._txn(write=True) as conn:
+            # A backup pins a complete published version; a corrupt directory
+            # has no such version, so backups are refused until it is rescued.
+            version = self._assert_intact(conn)
             if conn.execute("SELECT 1 FROM backups WHERE name=?", (backup_name,)).fetchone():
                 raise BackupNameTaken(f"备份名称已存在: {backup_name}")
-            version = self._current_version(conn)
             entries = self._entries(conn, version)
             if len(entries) > MAX_SERVICES:
                 raise InputError(f"服务数量超出上限 {MAX_SERVICES}")
@@ -786,7 +832,15 @@ class DirectoryStore:
         thread.start()
         return thread
 
-    def restore_backup(self, name: Any) -> dict:
+    def restore_backup(self, name: Any, *, rescue: bool = False) -> dict:
+        """Restore from a named backup.
+
+        ``rescue=True`` is entered from the rescue page when the published
+        version pointer is missing or dangling.  Ordinary restores first check
+        that the directory is intact; rescue restores refuse to run when the
+        directory has meanwhile been repaired (``AlreadyRepaired``), leaving
+        the now-effective version untouched.
+        """
         backup_name = validate_backup_name(name)
         self._ensure_ready()
         owner = secrets.token_hex(16)
@@ -811,6 +865,15 @@ class DirectoryStore:
                     raise RestoreInProgress()
                 if conn.execute("SELECT 1 FROM backups WHERE name=?", (backup_name,)).fetchone() is None:
                     raise NotFoundError(f"备份不存在: {backup_name}")
+                problem = self._directory_problem(conn)
+                if rescue:
+                    if problem is None:
+                        # Someone repaired the directory between rendering the
+                        # rescue page and submitting it.  Do not stomp on the
+                        # version that is now serving traffic.
+                        raise AlreadyRepaired()
+                elif problem is not None:
+                    raise DirectoryCorrupt(details=[problem])
                 self._meta_set(conn, "restore_state", "restoring")
                 self._meta_set(conn, "restore_backup", backup_name)
                 self._meta_set(conn, "restore_owner", owner)
@@ -847,9 +910,15 @@ class DirectoryStore:
                         code="restore_lease_lost",
                     )
                 validated = self._validate_backup(conn, backup_name)
-                previous = self._current_version(conn)
+                problem = self._directory_problem(conn)
+                if rescue and problem is None:
+                    raise AlreadyRepaired()
+                previous = None if problem is not None else self._current_version(conn)
                 new_version = self._create_version(
-                    conn, validated.version_id, "restore", f"恢复备份 {backup_name}"
+                    conn,
+                    validated.version_id,
+                    "rescue" if rescue else "restore",
+                    f"救援：用备份 {backup_name} 重建目录" if rescue else f"恢复备份 {backup_name}",
                 )
                 self._set_current(conn, new_version)
                 self._clear_restore(conn)
@@ -861,6 +930,7 @@ class DirectoryStore:
                 "restored_version": validated.version_id,
                 "entry_count": validated.entry_count,
                 "digest": validated.digest,
+                "rescue": rescue,
             }
             self._fire("after_restore_commit", result)
             return result
@@ -882,3 +952,7 @@ class DirectoryStore:
             if keeper is not None:
                 keeper.join(timeout=2.0)
             self._release_restore_lock(lock_fd)
+
+    def rescue_from_backup(self, name: Any) -> dict:
+        """Rebuild the published directory from a named backup."""
+        return self.restore_backup(name, rescue=True)

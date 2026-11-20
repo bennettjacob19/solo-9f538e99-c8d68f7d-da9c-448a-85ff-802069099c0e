@@ -7,7 +7,7 @@ from pathlib import Path
 
 from flask import Flask, jsonify, redirect, render_template, request, url_for
 
-from .errors import DirectoryError, InputError
+from .errors import AlreadyRepaired, DirectoryCorrupt, DirectoryError, InputError
 from .store import DirectoryStore
 
 
@@ -50,6 +50,12 @@ def create_app(store: DirectoryStore | None = None, *, config: dict | None = Non
     def handle_directory_error(exc: DirectoryError):
         if _wants_json():
             return jsonify({"ok": False, "error": exc.to_dict()}), exc.status_code
+        if isinstance(exc, AlreadyRepaired):
+            # The directory is healthy again: show the live directory (with the
+            # message) instead of a dead-end error page.
+            return _render_rescue_or_index(error=exc.message, status=exc.status_code)
+        if isinstance(exc, DirectoryCorrupt):
+            return _render_rescue_or_index(error=exc.message, status=exc.status_code)
         return (
             render_template(
                 "error.html",
@@ -161,16 +167,53 @@ def create_app(store: DirectoryStore | None = None, *, config: dict | None = Non
         result = store.restore_backup(name)
         return jsonify({"ok": True, **result})
 
+    @app.post("/api/rescue")
+    def api_rescue():
+        payload = request.get_json(silent=True)
+        if not isinstance(payload, dict):
+            raise InputError("请求体必须是 JSON 对象")
+        name = payload.get("backup")
+        store.validate_backup(name)
+        result = store.rescue_from_backup(name)
+        return jsonify({"ok": True, **result})
+
     # -- HTML -------------------------------------------------------------
 
     def _redirect_back(**kwargs):
         return redirect(url_for("index", **kwargs), code=303)
 
+    def _render_rescue_or_index(*, message: str | None = None,
+                                error: str | None = None, status: int = 200):
+        """Render the rescue page only while the directory is actually broken.
+
+        Shared by the index route and by error handlers, so a stale rescue
+        submission cannot show a rescue page for a directory that is healthy
+        again, and an index load during corruption never 500s.
+        """
+        state = store.rescue_snapshot()
+        if not state["corrupt"]:
+            snapshot = store.snapshot()
+            return (
+                render_template(
+                    "index.html", state=snapshot, rescue=None,
+                    message=message, error=error,
+                ),
+                status,
+            )
+        return (
+            render_template(
+                "rescue.html", state=state, message=message, error=error,
+            ),
+            status,
+        )
+
     @app.get("/")
     def index():
-        snapshot = store.snapshot()
-        return render_template("index.html", state=snapshot, message=request.args.get("message"),
-                               error=request.args.get("error"))
+        # Reads both the live directory and the rescue view inside one place:
+        # a corrupt directory renders the rescue page instead of failing.
+        return _render_rescue_or_index(
+            message=request.args.get("message"), error=request.args.get("error")
+        )
 
     @app.post("/services")
     def form_upsert():
@@ -206,6 +249,12 @@ def create_app(store: DirectoryStore | None = None, *, config: dict | None = Non
     def form_restore_backup(name: str):
         try:
             result = store.restore_backup(name)
+        except DirectoryCorrupt:
+            # Ordinary restores may not run while the directory is corrupt;
+            # point the operator at the rescue flow instead.
+            return _redirect_back(
+                error="目录状态损坏：普通恢复已禁用，请使用命名备份救援"
+            )
         except DirectoryError as exc:
             return _redirect_back(error=exc.message)
         return _redirect_back(
@@ -213,4 +262,46 @@ def create_app(store: DirectoryStore | None = None, *, config: dict | None = Non
                     f"新目录版本 {result['new_version']}"
         )
 
+    @app.post("/rescue")
+    def form_rescue():
+        """Validate the chosen backup, then rebuild the current directory."""
+        name = request.form.get("backup")
+        try:
+            # Validate first so an unusable backup leaves the operator on the
+            # rescue page with the directory untouched, free to pick another.
+            store.validate_backup(name)
+            result = store.rescue_from_backup(name)
+        except AlreadyRepaired as exc:
+            # Someone fixed the directory while this page was open.  Show the
+            # repaired directory (and its effective version) and ask for a
+            # refresh instead of overwriting it.
+            return _render_rescue_or_index(
+                error=exc.message, status=exc.status_code
+            )
+        except DirectoryError as exc:
+            return _render_rescue_or_index(
+                error=_with_details(exc), status=exc.status_code
+            )
+        except Exception as exc:  # publishing must fail back onto this page
+            app.logger.exception("rescue failed")
+            return _render_rescue_or_index(
+                error=f"救援发布失败，目录未修改：{exc}", status=500
+            )
+        return redirect(
+            url_for(
+                "index",
+                message=(
+                    f"已用备份 {result['backup']} 救援重建目录："
+                    f"{result['entry_count']} 条，新目录版本 {result['new_version']}"
+                ),
+            ),
+            code=303,
+        )
+
     return app
+
+
+def _with_details(exc: DirectoryError) -> str:
+    if not exc.details:
+        return exc.message
+    return exc.message + "：" + "；".join(exc.details)

@@ -55,6 +55,40 @@ class BackupNameTaken(ConflictError):
     code = "backup_name_taken"
 
 
+class DirectoryCorrupt(DirectoryError):
+    """The published version pointer is missing, invalid, or dangling.
+
+    The directory itself is unusable, but the named backups in the same
+    database are still readable and can be used to rebuild it.
+    """
+
+    status_code = 503
+    code = "directory_corrupt"
+
+    def __init__(
+        self,
+        message: str = "目录状态损坏，无法读取当前目录；请使用命名备份救援",
+        *,
+        details: list[str] | None = None,
+    ) -> None:
+        super().__init__(message, details=details)
+
+
+class AlreadyRepaired(ConflictError):
+    """A rescue was submitted after the directory had already been repaired."""
+
+    status_code = 409
+    code = "already_repaired"
+
+    def __init__(
+        self,
+        message: str = (
+            "目录已恢复正常，无需救援；已生效的目录版本未被修改，请刷新页面查看"
+        ),
+    ) -> None:
+        super().__init__(message)
+
+
 class BackupValidationError(DirectoryError):
     status_code = 422
     code = "invalid_backup"

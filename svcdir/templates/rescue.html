@@ -1,0 +1,76 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>目录救援 · 本地服务发现目录</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+<header>
+  <h1>目录救援</h1>
+  <p class="sub">当前目录不可读，请选择一份命名备份重建目录。</p>
+</header>
+
+<main>
+  {% if error %}<div class="flash bad" role="alert">{{ error }}</div>{% endif %}
+  {% if message %}<div class="flash ok" role="status">{{ message }}</div>{% endif %}
+
+  <div class="flash warn" role="alert">
+    <strong>目录状态损坏。</strong>
+    {% if state.problem %}<span class="mono small">{{ state.problem }}</span>{% endif %}
+    救援期间 <span class="mono">/resolve</span> 会明确返回目录损坏；
+    新增、修改、删除服务以及创建备份都会被拒绝。
+  </div>
+
+  {% if state.restore.state == 'restoring' %}
+  <div class="flash warn" role="alert">
+    正在从备份 <strong>{{ state.restore.backup }}</strong> 救援恢复，请稍候。
+  </div>
+  {% endif %}
+
+  <section class="card">
+    <h2>命名备份 <span class="badge">{{ state.backups|length }} 份</span></h2>
+    <p class="muted small">
+      备份保存在同一个 SQLite 数据库中。选定一份后系统会先校验（条目数、服务名/地址、
+      摘要），校验通过才会用它重建当前目录；失败时目录保持损坏状态，可另选备份重试。
+    </p>
+    {% if state.backups %}
+    <table>
+      <thead><tr><th>名称</th><th>目录版本</th><th>条目</th><th>创建时间</th><th>摘要</th><th></th></tr></thead>
+      <tbody>
+      {% for b in state.backups %}
+        <tr>
+          <td class="mono">{{ b.name }}</td>
+          <td>{{ b.version }}</td>
+          <td>{{ b.entry_count }}</td>
+          <td class="mono small">{{ b.created_at }}</td>
+          <td class="mono small" title="{{ b.digest }}">{{ b.digest[:12] }}…</td>
+          <td class="right">
+            <form method="post" action="{{ url_for('form_rescue') }}"
+                  data-confirm="用备份 {name} 重建当前目录？" data-name="{{ b.name }}">
+              <input type="hidden" name="backup" value="{{ b.name }}">
+              <button type="submit">校验并重建</button>
+            </form>
+          </td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+    {% else %}
+    <p class="muted">数据库里没有可用的命名备份，无法救援。</p>
+    {% endif %}
+  </section>
+
+  <section class="card">
+    <h2>说明</h2>
+    <ul class="small muted">
+      <li>救援成功后，首页与 <span class="mono">/resolve</span> 会读到新版本的完整目录，重启后仍然可用。</li>
+      <li>若提交时目录已被他人修复，本次救援不会覆盖已生效的版本，页面会提示刷新。</li>
+      <li>普通恢复（从备份列表的「恢复」按钮）在目录损坏期间被禁用，请使用本页。</li>
+    </ul>
+  </section>
+</main>
+<script src="{{ url_for('static', filename='app.js') }}" defer></script>
+</body>
+</html>

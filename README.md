@@ -38,8 +38,8 @@ SVCDIR_DB=./data/directory.sqlite3 python3 -m svcdir   # 开发用内置服务�
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| GET | `/` | 网页：目录、修改表单、备份列表、恢复按钮 |
-| GET | `/resolve?name=<服务名>` | 返回单个服务的地址 |
+| GET | `/` | 网页：目录、修改表单、备份列表、恢复按钮；目录损坏时自动变为救援页 |
+| GET | `/resolve?name=<服务名>` | 返回单个服务的地址；目录损坏时返回 503 `directory_corrupt` |
 | GET | `/resolve` | 返回整个当前目录 |
 | GET | `/api/state` | 当前版本、完整目录、恢复状态、备份列表 |
 | GET | `/api/backups` | 备份列表 |
@@ -47,10 +47,34 @@ SVCDIR_DB=./data/directory.sqlite3 python3 -m svcdir   # 开发用内置服务�
 | DELETE | `/api/services/<名>` | 删除 |
 | POST | `/api/backups` | `{"name": ...}` 创建命名备份 |
 | GET | `/api/backups/<名>/validate` | 校验备份（不修改目录） |
-| POST | `/api/backups/<名>/restore` | 从备份恢复 |
+| POST | `/api/backups/<名>/restore` | 从备份恢复（仅当目录正常时） |
+| POST | `/api/rescue` | `{"backup": ...}` 校验并用备份重建损坏的目录 |
+| POST | `/rescue` | 网页救援表单：校验选定备份并重建目录 |
 
-浏览器表单走 `POST /services`、`/backups`、`/backups/<名>/restore`，
+浏览器表单走 `POST /services`、`/backups`、`/backups/<名>/restore`、`/rescue`，
 成功后 303 跳回页面并显示结果或错误。
+
+## 目录损坏时的救援
+
+当 `meta.current_version` 丢失/无效，或指向一个不存在的版本时，目录视为**损坏**：
+
+- **首页不再报错。** `GET /` 直接渲染救援页（`templates/rescue.html`），列出同一
+  SQLite 库里仍可读的命名备份，运维员可任选一份。
+- **`/resolve` 明确报损坏。** 返回 503 与 `error.code = directory_corrupt`
+  （附原因），绝不把损坏的目录当成「空目录」返回 `count: 0`。
+- **写入全部拒绝。** 新增/修改/删除服务、创建备份都返回 503
+  `directory_corrupt`；普通「从备份恢复」也被拒绝并引导到救援页
+  （`/api/backups/<名>/restore` 同样拒绝，救援必须显式走 `/api/rescue`）。
+- **先校验再发布。** 提交救援时先执行与恢复相同的完整校验（版本存在、条目数、
+  服务名/地址合法性、摘要）。校验失败 → 留在救援页并显示原因，目录保持损坏，
+  可另选备份；发布阶段的任何失败同样留在救援页。
+- **不覆盖已修好的目录。** 若提交救援时目录已被他人修复，救援中止并返回 409
+  `already_repaired`，页面提示刷新，已生效的版本与内容保持不变。
+- **成功即发布完整新版本。** 救援与恢复共用同一原子切换：创建完整新版本并切换
+  `current_version`，因此成功后首页与 `/resolve` 读到备份的完整目录，重启后仍
+  有效；随后可继续增删服务、创建备份。
+
+## 一致性与恢复语义
 
 查询响应示例：
 
@@ -111,15 +135,22 @@ python3 -m pytest -q
 - `test_http_rejects_writes_and_serves_reads_during_restore`
 - `test_api_flow` / `test_html_page_and_forms` / `test_html_escapes_hostile_names`
 - `test_api_validation_errors_are_json` / `test_edge_case_inputs_are_rejected_cleanly`
+- `test_missing_version_pointer_fails_loudly` / `test_dangling_version_pointer_is_not_an_empty_directory`
+- `test_writes_and_backups_rejected_while_corrupt`
+- `test_rescue_rebuilds_directory_from_backup` / `test_rescue_survives_restart`
+- `test_rescue_from_corrupt_backup_keeps_directory_broken`
+- `test_rescue_submitted_after_repair_keeps_effective_version`
+- `test_rescue_http_flow` / `test_rescue_http_validation_failure_stays_on_rescue_page`
+- `test_rescue_http_publish_failure_stays_on_rescue_page` / `test_api_rescue_flow`
 
 ## 布局
 
 ```
-svcdir/errors.py     错误类型 → HTTP 状态码
-svcdir/store.py      目录版本、命名备份、校验、恢复（核心逻辑）
-svcdir/web.py        Flask 路由：网页 + API
-svcdir/templates/    页面模板
-tests/test_svcdir.py 自测（含并发交错）
+svcdir/errors.py     错误类型 → HTTP 状态码（含 directory_corrupt / already_repaired）
+svcdir/store.py      目录版本、命名备份、校验、恢复与救援（核心逻辑）
+svcdir/web.py        Flask 路由：网页 + API + 救援页
+svcdir/templates/    页面模板（index / rescue / error）
+tests/test_svcdir.py 自测（含并发交错与救援）
 Dockerfile / docker-compose.yml
 ```
 

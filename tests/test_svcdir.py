@@ -10,8 +10,10 @@ import pytest
 
 from svcdir import DirectoryStore, create_app
 from svcdir.errors import (
+    AlreadyRepaired,
     BackupValidationError,
     ConflictError,
+    DirectoryCorrupt,
     NotFoundError,
     RestoreInProgress,
 )
@@ -781,3 +783,346 @@ def test_html_escapes_hostile_names(client):
     resp = client.get("/")
     assert resp.headers["X-Content-Type-Options"] == "nosniff"
     assert "script-src 'self'" in resp.headers["Content-Security-Policy"]
+
+
+# ---------------------------------------------------------------------------
+# Lost version pointer / dangling version: fail closed and rescue
+
+
+def _lose_current_version(db) -> None:
+    with sqlite3.connect(db) as conn:
+        conn.execute("DELETE FROM meta WHERE key='current_version'")
+
+
+def _dangle_current_version(db, version_id: int = 99999) -> None:
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO meta(key, value) VALUES('current_version', ?)",
+            (str(version_id),),
+        )
+
+
+def test_missing_version_pointer_fails_loudly(store):
+    seed(store, {"a": "1"})
+    _lose_current_version(store.db_path)
+    with pytest.raises(DirectoryCorrupt) as excinfo:
+        store.resolve()
+    assert "current_version" in excinfo.value.details[0]
+    with pytest.raises(DirectoryCorrupt):
+        store.snapshot()
+    # Rescuing still sees the backups and why it is broken.
+    state = store.rescue_snapshot()
+    assert state["corrupt"] is True
+    assert state["backups"] == []
+
+
+def test_dangling_version_pointer_is_not_an_empty_directory(store):
+    seed(store, {"a": "1", "b": "2"})
+    _dangle_current_version(store.db_path)
+    with pytest.raises(DirectoryCorrupt) as excinfo:
+        store.resolve()
+    assert "99999" in excinfo.value.details[0]
+    # Whole-directory resolution must not masquerade as an empty directory.
+    with pytest.raises(DirectoryCorrupt):
+        store.resolve(None)
+
+
+def test_invalid_version_pointer_is_corrupt(store):
+    seed(store, {"a": "1"})
+    with sqlite3.connect(store.db_path) as conn:
+        conn.execute("UPDATE meta SET value='garbage' WHERE key='current_version'")
+    with pytest.raises(DirectoryCorrupt):
+        store.resolve()
+
+
+def test_writes_and_backups_rejected_while_corrupt(store):
+    seed(store, {"a": "1"})
+    store.create_backup("before")
+    _lose_current_version(store.db_path)
+    with pytest.raises(DirectoryCorrupt):
+        store.upsert("b", "2")
+    with pytest.raises(DirectoryCorrupt):
+        store.delete("a")
+    with pytest.raises(DirectoryCorrupt):
+        store.create_backup("during")
+    assert [b["name"] for b in store.list_backups()] == ["before"]
+    # Ordinary restore is not a rescue: it refuses to guess.
+    with pytest.raises(DirectoryCorrupt):
+        store.restore_backup("before")
+
+
+def test_rescue_rebuilds_directory_from_backup(store):
+    seed(store, {"a": "1", "b": "2"})
+    store.create_backup("snap")
+    store.upsert("a", "changed")
+    _lose_current_version(store.db_path)
+
+    result = store.rescue_from_backup("snap")
+    assert result["rescue"] is True
+    assert result["entry_count"] == 2
+    assert result["new_version"] != result["restored_version"]
+    resolved = store.resolve()
+    assert resolved["services"] == {"a": "1", "b": "2"}
+    assert resolved["version"] == result["new_version"]
+    assert store.snapshot()["version"] == result["new_version"]
+    # Normal operation resumes, including new backups.
+    store.upsert("c", "3")
+    store.create_backup("after")
+
+
+def test_rescue_survives_restart(tmp_path):
+    db = tmp_path / "dir.sqlite3"
+    store = DirectoryStore(db)
+    seed(store, {"a": "1", "b": "2"})
+    store.create_backup("snap")
+    _dangle_current_version(db)
+    new_version = store.rescue_from_backup("snap")["new_version"]
+
+    restarted = DirectoryStore(db)
+    restarted.initialize()
+    assert restarted.resolve()["services"] == {"a": "1", "b": "2"}
+    assert restarted.resolve()["version"] == new_version
+
+
+def test_rescue_from_corrupt_backup_keeps_directory_broken(store):
+    seed(store, {"a": "1", "b": "2"})
+    store.create_backup("snap")
+    _lose_current_version(store.db_path)
+    with sqlite3.connect(store.db_path) as conn:
+        conn.execute("UPDATE entries SET address='tampered' WHERE service='a'")
+    before = store.rescue_snapshot()
+    with pytest.raises(BackupValidationError):
+        store.rescue_from_backup("snap")
+    after = store.rescue_snapshot()
+    assert after["corrupt"] is True
+    assert after["restore"]["state"] == "idle"
+    # Nothing was published: still corrupt, not a half-built directory.
+    with pytest.raises(DirectoryCorrupt):
+        store.resolve()
+    assert before["problem"] == after["problem"]
+
+
+def test_rescue_unknown_backup_is_404(store):
+    store.initialize()
+    _lose_current_version(store.db_path)
+    with pytest.raises(NotFoundError):
+        store.rescue_from_backup("nope")
+    assert store.rescue_snapshot()["corrupt"] is True
+
+
+def test_rescue_submitted_after_repair_keeps_effective_version(store):
+    seed(store, {"a": "backup", "b": "backup"})
+    store.create_backup("snap")
+    store.upsert("a", "live")
+    # The operator opens the rescue page while the pointer is lost ...
+    _lose_current_version(store.db_path)
+    assert store.rescue_snapshot()["corrupt"] is True
+    # ... and someone else repairs it before the form is submitted.
+    with sqlite3.connect(store.db_path) as conn:
+        version = conn.execute(
+            "SELECT MAX(id) FROM versions"
+        ).fetchone()[0]
+        conn.execute(
+            "INSERT OR REPLACE INTO meta(key, value) VALUES('current_version', ?)",
+            (str(version),),
+        )
+    effective = store.resolve()
+    with pytest.raises(AlreadyRepaired):
+        store.rescue_from_backup("snap")
+    assert store.resolve()["version"] == effective["version"]
+    assert store.resolve()["services"] == effective["services"]
+
+
+def test_rescue_http_flow(tmp_path):
+    db = tmp_path / "web.sqlite3"
+    app = create_app(DirectoryStore(db))
+    app.config.update(TESTING=True)
+    client = app.test_client()
+    client.post("/api/services", json={"service": "a", "address": "1"})
+    client.post("/api/services", json={"service": "b", "address": "2"})
+    client.post("/api/backups", json={"name": "snap"})
+    client.post("/api/services", json={"service": "a", "address": "changed"})
+    _lose_current_version(db)
+
+    # The home page always renders: it becomes the rescue page.
+    page = client.get("/")
+    assert page.status_code == 200
+    html = page.get_data(as_text=True)
+    assert "目录救援" in html
+    assert "snap" in html
+    assert "/resolve" in html
+
+    # /resolve says the directory is corrupt instead of empty.
+    resolved = client.get("/resolve")
+    assert resolved.status_code == 503
+    assert resolved.get_json()["error"]["code"] == "directory_corrupt"
+    resolved = client.get("/resolve?name=a")
+    assert resolved.status_code == 503
+    assert resolved.get_json()["ok"] is False
+
+    # Writes and backup creation are refused (JSON) ...
+    assert client.post("/api/services", json={"service": "c", "address": "3"}).status_code == 503
+    assert client.delete("/api/services/a").status_code == 503
+    assert client.post("/api/backups", json={"name": "x"}).status_code == 503
+    # ... and via the HTML forms, which keep the rescue page up.
+    reply = client.post("/services", data={"service": "c", "address": "3"})
+    assert reply.status_code == 303
+    follow = client.get(reply.headers["Location"])
+    assert follow.status_code == 200
+    assert "目录救援" in follow.get_data(as_text=True)
+    assert client.post("/backups", data={"name": "x"}).status_code == 303
+    assert client.get("/api/backups").get_json()["backups"][0]["name"] == "snap"
+
+    # A normal restore is redirected back to the rescue page.
+    reply = client.post("/backups/snap/restore")
+    assert reply.status_code == 303
+    assert "目录救援" in client.get(reply.headers["Location"]).get_data(as_text=True)
+
+    # Rescue through the form: validate + publish, then back to a normal page.
+    reply = client.post("/rescue", data={"backup": "snap"})
+    assert reply.status_code == 303
+    page = client.get(reply.headers["Location"])
+    assert page.status_code == 200
+    assert "目录救援" not in page.get_data(as_text=True)
+    assert "救援重建目录" in page.get_data(as_text=True)
+    assert client.get("/resolve?name=a").get_json()["address"] == "1"
+    assert client.get("/resolve").get_json()["services"] == {"a": "1", "b": "2"}
+    state = client.get("/api/state").get_json()
+    assert state["services"] == [
+        {"service": "a", "address": "1"},
+        {"service": "b", "address": "2"},
+    ]
+    assert client.post("/api/backups", json={"name": "after"}).status_code == 201
+
+
+def test_rescue_http_validation_failure_stays_on_rescue_page(tmp_path):
+    db = tmp_path / "web.sqlite3"
+    app = create_app(DirectoryStore(db))
+    app.config.update(TESTING=True)
+    client = app.test_client()
+    client.post("/api/services", json={"service": "a", "address": "1"})
+    client.post("/api/backups", json={"name": "good"})
+    # Give the bad backup a version of its own so tampering it leaves "good" intact.
+    client.post("/api/services", json={"service": "b", "address": "2"})
+    client.post("/api/backups", json={"name": "bad"})
+    with sqlite3.connect(db) as conn:
+        bad_version = conn.execute(
+            "SELECT version_id FROM backups WHERE name='bad'"
+        ).fetchone()[0]
+        conn.execute(
+            "UPDATE entries SET address='tampered' WHERE version_id=?", (bad_version,)
+        )
+    _lose_current_version(db)
+
+    reply = client.post("/rescue", data={"backup": "bad"})
+    assert reply.status_code == 422
+    body = reply.get_data(as_text=True)
+    assert "目录救援" in body
+    assert "校验失败" in body
+    # Still broken, still rescuable with the good backup.
+    assert client.get("/resolve").status_code == 503
+    reply = client.post("/rescue", data={"backup": "good"})
+    assert reply.status_code == 303
+    assert client.get("/resolve?name=a").get_json()["address"] == "1"
+
+
+def test_rescue_http_after_repair_asks_to_refresh(tmp_path):
+    db = tmp_path / "web.sqlite3"
+    app = create_app(DirectoryStore(db))
+    app.config.update(TESTING=True)
+    client = app.test_client()
+    client.post("/api/services", json={"service": "a", "address": "backup"})
+    client.post("/api/backups", json={"name": "snap"})
+    client.post("/api/services", json={"service": "a", "address": "live"})
+    # Render the rescue page while corrupt.
+    _lose_current_version(db)
+    assert "目录救援" in client.get("/").get_data(as_text=True)
+    # Repair in the meantime (as another operator / process would).
+    with sqlite3.connect(db) as conn:
+        version = conn.execute("SELECT MAX(id) FROM versions").fetchone()[0]
+        conn.execute(
+            "INSERT OR REPLACE INTO meta(key, value) VALUES('current_version', ?)",
+            (str(version),),
+        )
+    effective = client.get("/api/state").get_json()
+
+    reply = client.post("/rescue", data={"backup": "snap"}, follow_redirects=False)
+    assert reply.status_code == 409
+    body = reply.get_data(as_text=True)
+    assert "目录救援" not in body
+    assert "无需救援" in body
+    # The version that took effect is untouched.
+    after = client.get("/api/state").get_json()
+    assert after["version"] == effective["version"]
+    assert after["services"] == [{"service": "a", "address": "live"}]
+
+
+def test_rescue_http_publish_failure_stays_on_rescue_page(tmp_path, monkeypatch):
+    db = tmp_path / "web.sqlite3"
+    store = DirectoryStore(db)
+    app = create_app(store)
+    app.config.update(TESTING=True)
+    client = app.test_client()
+    client.post("/api/services", json={"service": "a", "address": "1"})
+    client.post("/api/backups", json={"name": "snap"})
+    client.post("/api/services", json={"service": "b", "address": "2"})
+    _lose_current_version(db)
+
+    def boom(conn, source_version, kind, note):
+        raise RuntimeError("simulated publish failure")
+
+    monkeypatch.setattr(store, "_create_version", boom)
+    reply = client.post("/rescue", data={"backup": "snap"})
+    assert reply.status_code == 500
+    body = reply.get_data(as_text=True)
+    assert "目录救援" in body
+    assert "snap" in body  # still selectable
+    monkeypatch.undo()
+    assert client.get("/resolve").status_code == 503
+    assert store.rescue_snapshot()["restore"]["state"] == "idle"
+    # Another backup can still be chosen and succeeds.
+    reply = client.post("/rescue", data={"backup": "snap"})
+    assert reply.status_code == 303
+    assert client.get("/resolve?name=a").get_json()["address"] == "1"
+
+
+def test_api_rescue_flow(tmp_path):
+    db = tmp_path / "web.sqlite3"
+    app = create_app(DirectoryStore(db))
+    app.config.update(TESTING=True)
+    client = app.test_client()
+    client.post("/api/services", json={"service": "a", "address": "1"})
+    client.post("/api/backups", json={"name": "snap"})
+    _lose_current_version(db)
+    assert client.post("/api/backups/nope/restore").status_code == 404
+    assert client.post("/api/rescue", json={"backup": "nope"}).status_code == 404
+    resp = client.post("/api/rescue", json={"backup": "snap"})
+    assert resp.status_code == 200
+    assert resp.get_json()["rescue"] is True
+    assert client.get("/resolve?name=a").get_json()["address"] == "1"
+    # Rescuing a healthy directory is a no-op conflict.
+    assert client.post("/api/rescue", json={"backup": "snap"}).status_code == 409
+
+
+def test_rescue_rejected_while_restore_in_progress(store):
+    seed(store, {"a": "1"})
+    store.create_backup("snap")
+    _lose_current_version(store.db_path)
+    with sqlite3.connect(store.db_path) as conn:
+        conn.execute("UPDATE meta SET value='restoring' WHERE key='restore_state'")
+        conn.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('restore_owner','live')")
+        conn.execute(
+            "INSERT OR REPLACE INTO meta(key,value) VALUES('restore_lease_until',?)",
+            (str(time.time() + 3600),),
+        )
+    lock_path = store.db_path + ".restore.lock"
+    import fcntl
+    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    try:
+        with pytest.raises(RestoreInProgress):
+            store.rescue_from_backup("snap")
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+    assert store.rescue_snapshot()["corrupt"] is True
